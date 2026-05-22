@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/weave-agent/weave/sdk"
 	"github.com/weave-agent/weave/sdk/model"
+	"github.com/weave-agent/weave/sdk/providerhttp"
+	"github.com/weave-agent/weave/sdk/providerretry"
 	"github.com/weave-agent/weave/sdk/retry"
 )
 
@@ -36,31 +39,45 @@ type AuthConfig struct {
 }
 
 type provider struct {
-	client    anthropic.Client
-	model     string
-	maxTokens int
+	client      anthropic.Client
+	model       string
+	maxTokens   int
+	retryConfig retry.Config
 }
 
-// retryConfig controls retry behavior for stream requests. It is a variable so
-// tests can override it with faster settings.
-var retryConfig = retry.DefaultConfig()
-
 func init() {
-	sdk.RegisterProvider[AnthropicConfig, AuthConfig]("anthropic", func(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider, error) {
-		if a.APIKey == "" {
-			return nil, errors.New("anthropic: API key required (set ANTHROPIC_API_KEY)")
-		}
+	sdk.RegisterProvider[AnthropicConfig, AuthConfig]("anthropic", newProvider)
+}
 
-		apiKey := a.APIKey
+var newAnthropicClient = func(apiKey string, httpClient *http.Client) anthropic.Client {
+	return anthropic.NewClient(
+		option.WithAPIKey(apiKey),
+		option.WithHTTPClient(httpClient),
+		option.WithMaxRetries(0),
+	)
+}
 
-		client := anthropic.NewClient(option.WithAPIKey(apiKey))
+func newProvider(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider, error) {
+	if a.APIKey == "" {
+		return nil, errors.New("anthropic: API key required (set ANTHROPIC_API_KEY)")
+	}
 
-		return &provider{
-			client:    client,
-			model:     ac.Model,
-			maxTokens: ac.MaxTokens,
-		}, nil
-	})
+	httpClient, _, err := providerhttp.ForProvider(cfg, "anthropic")
+	if err != nil {
+		return nil, err
+	}
+
+	retryCfg, _, err := providerretry.ForProvider(cfg, "anthropic")
+	if err != nil {
+		return nil, err
+	}
+
+	return &provider{
+		client:      newAnthropicClient(a.APIKey, httpClient),
+		model:       ac.Model,
+		maxTokens:   ac.MaxTokens,
+		retryConfig: retryCfg,
+	}, nil
 }
 
 // NewProviderWithClient creates a provider with a pre-configured client (for testing).
@@ -69,7 +86,12 @@ func NewProviderWithClient(client anthropic.Client, modelName string) sdk.Provid
 		modelName = defaultModel
 	}
 
-	return &provider{client: client, model: modelName, maxTokens: defaultMaxTokens}
+	return &provider{
+		client:      client,
+		model:       modelName,
+		maxTokens:   defaultMaxTokens,
+		retryConfig: retry.DefaultConfig(),
+	}
 }
 
 func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...model.StreamOption) (<-chan sdk.ProviderEvent, error) {
@@ -105,7 +127,7 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 			seenToolCalls: make(map[string]bool),
 		}
 
-		cfg := retryConfig
+		cfg := p.retryConfig
 
 		var lastErr error
 
@@ -113,7 +135,15 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 
 		for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 			if attempt > 0 {
-				delay := retry.CalculateDelay(cfg, attempt-1)
+				delay := retry.JitteredDelay(retry.CalculateDelay(cfg, attempt-1), cfg.Jitter)
+				sdk.Logger("anthropic").Debug("anthropic stream retry",
+					"attempt", attempt,
+					"next_attempt", attempt+1,
+					"max_retries", cfg.MaxRetries,
+					"delay", delay.String(),
+					"error_type", fmt.Sprintf("%T", lastErr),
+				)
+
 				timer := time.NewTimer(delay)
 
 				select {
@@ -174,6 +204,10 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 				lastErr = err
 
 				continue
+			}
+
+			if !acc.validateCompletedTotals(curText.String(), curThinking.String(), send) {
+				return
 			}
 
 			success = true
@@ -263,6 +297,23 @@ func (a *streamAccumulator) emitThinkingIfNew(curTotal string, send func(sdk.Pro
 	})
 
 	return false
+}
+
+func (a *streamAccumulator) validateCompletedTotals(curText, curThinking string, send func(sdk.ProviderEvent) bool) bool {
+	if !completedTotalCoversEmitted(a.text.String(), curText) || !completedTotalCoversEmitted(a.thinking.String(), curThinking) {
+		send(sdk.ProviderEvent{
+			Type:    sdk.ProviderEventError,
+			Content: "anthropic: stream diverged after retry",
+		})
+
+		return false
+	}
+
+	return true
+}
+
+func completedTotalCoversEmitted(emitted, completed string) bool {
+	return len(emitted) <= len(completed) && strings.HasPrefix(completed, emitted)
 }
 
 func (a *streamAccumulator) emitThinkingDone(st sdk.SignedThinking, send func(sdk.ProviderEvent) bool) bool {
@@ -362,7 +413,7 @@ func isRetriableError(err error) bool {
 		return true
 	}
 
-	if strings.Contains(msgLower, "timeout") || strings.Contains(msgLower, "deadline exceeded") {
+	if strings.Contains(msgLower, "timeout") || strings.Contains(msgLower, "deadline exceeded") || strings.Contains(msgLower, "eof") {
 		return true
 	}
 

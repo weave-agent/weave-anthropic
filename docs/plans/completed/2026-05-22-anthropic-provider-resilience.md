@@ -45,31 +45,31 @@ Apply shared provider retry SDK support to Anthropic and configure provider HTTP
 ## Implementation Steps
 
 ### Task 1: Wire Anthropic provider runtime configuration
-- [ ] update provider initialization to resolve `providerretry.ForProvider(cfg, "anthropic")`
-- [ ] configure SDK HTTP behavior from `providerhttp` if the SDK exposes a clean custom client or timeout option
-- [ ] store retry config in provider runtime state
-- [ ] preserve existing API key, model, and max token behavior
-- [ ] write tests for provider init with custom retry config
-- [ ] write tests for invalid retry config failing provider init
-- [ ] run `go test ./...` - must pass before next task
+- [x] update provider initialization to resolve `providerretry.ForProvider(cfg, "anthropic")`
+- [x] configure SDK HTTP behavior from `providerhttp` if the SDK exposes a clean custom client or timeout option
+- [x] store retry config in provider runtime state
+- [x] preserve existing API key, model, and max token behavior
+- [x] write tests for provider init with custom retry config
+- [x] write tests for invalid retry config failing provider init
+- [x] run `go test ./...` - must pass before next task
 
 ### Task 2: Preserve retry and dedupe semantics
-- [ ] replace runtime use of package-global retry defaults with provider runtime retry config
-- [ ] keep existing stream accumulator behavior for retried partial streams
-- [ ] apply configured jittered retry delay in Anthropic retry loop
-- [ ] add debug logging for retry attempts with safe fields only
-- [ ] update existing retry tests to use configured retry values
-- [ ] write tests for no duplicate text/thinking after retry
-- [ ] run `go test ./...` - must pass before next task
+- [x] replace runtime use of package-global retry defaults with provider runtime retry config
+- [x] keep existing stream accumulator behavior for retried partial streams
+- [x] apply configured jittered retry delay in Anthropic retry loop
+- [x] add debug logging for retry attempts with safe fields only
+- [x] update existing retry tests to use configured retry values
+- [x] write tests for no duplicate text/thinking after retry
+- [x] run `go test ./...` - must pass before next task
 
 ### Task 3: Verify acceptance criteria
-- [ ] verify Anthropic retry uses provider config, not package-global runtime defaults
-- [ ] verify invalid provider HTTP/retry config fails provider initialization
-- [ ] verify retry debug logs exclude secrets, prompts, request bodies, and response bodies
-- [ ] run `go test ./...`
+- [x] verify Anthropic retry uses provider config, not package-global runtime defaults
+- [x] verify invalid provider HTTP/retry config fails provider initialization
+- [x] verify retry debug logs exclude secrets, prompts, request bodies, and response bodies
+- [x] run `go test ./...`
 
 ## Technical Details
-Anthropic HTTP client configuration depends on Anthropic SDK support. If the SDK cannot accept a custom HTTP client cleanly, record the limitation in this plan and still apply shared retry config.
+Anthropic SDK supports custom HTTP clients through `option.WithHTTPClient`, so provider HTTP settings from `providerhttp.ForProvider(cfg, "anthropic")` are applied during client construction.
 
 ## Post-Completion
 Manual verification:

@@ -1,12 +1,13 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,15 +22,14 @@ import (
 	"github.com/weave-agent/weave/sdk/retry"
 )
 
-func TestMain(m *testing.M) {
-	retryConfig = retry.Config{
+func fastRetryConfig() retry.Config {
+	return retry.Config{
 		MaxRetries: 2,
 		BaseDelay:  1 * time.Millisecond,
 		MaxDelay:   10 * time.Millisecond,
 		Multiplier: 2,
+		Jitter:     retry.JitterNone,
 	}
-
-	os.Exit(m.Run())
 }
 
 type sseEvent struct {
@@ -94,9 +94,180 @@ func newTestProvider(server *httptest.Server) sdk.Provider {
 	client := anthropic.NewClient(
 		option.WithAPIKey("test-key"),
 		option.WithBaseURL(server.URL),
+		option.WithMaxRetries(0),
 	)
 
-	return NewProviderWithClient(client, "claude-sonnet-4-6")
+	p := NewProviderWithClient(client, "claude-sonnet-4-6").(*provider)
+	p.retryConfig = fastRetryConfig()
+
+	return p
+}
+
+type providerConfigStub struct {
+	providers map[string]map[string]any
+	sdk.NoopConfig
+}
+
+func (s *providerConfigStub) ExtensionConfig(scope, name string, target any) error {
+	if scope != "providers" {
+		return fmt.Errorf("unknown scope %q", scope)
+	}
+
+	section, ok := s.providers[name]
+	if !ok {
+		return nil
+	}
+
+	data, err := json.Marshal(section)
+	if err != nil {
+		return fmt.Errorf("marshal stub config: %w", err)
+	}
+
+	if err := json.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("unmarshal stub config: %w", err)
+	}
+
+	return nil
+}
+
+type failOnConfigLookup struct {
+	sdk.NoopConfig
+	t *testing.T
+}
+
+func (s failOnConfigLookup) ExtensionConfig(scope, name string, target any) error {
+	s.t.Helper()
+	s.t.Fatalf("ExtensionConfig(%q, %q) should not be called", scope, name)
+
+	return nil
+}
+
+func TestNewProvider_MissingAPIKey(t *testing.T) {
+	got, err := newProvider(failOnConfigLookup{t: t}, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{})
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Contains(t, err.Error(), "API key required")
+}
+
+func TestNewProvider_CustomRetryConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"retry": map[string]any{
+					"max_retries": 3,
+					"base_delay":  "250ms",
+					"max_delay":   "2s",
+					"multiplier":  1.5,
+					"jitter":      "none",
+				},
+			},
+		},
+	}
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     "claude-opus-4-1",
+		MaxTokens: 2048,
+	}, AuthConfig{APIKey: "test-key"})
+	require.NoError(t, err)
+
+	p, ok := got.(*provider)
+	require.True(t, ok)
+
+	assert.Equal(t, "claude-opus-4-1", p.model)
+	assert.Equal(t, 2048, p.maxTokens)
+	assert.Equal(t, 3, p.retryConfig.MaxRetries)
+	assert.Equal(t, 250*time.Millisecond, p.retryConfig.BaseDelay)
+	assert.Equal(t, 2*time.Second, p.retryConfig.MaxDelay)
+	assert.InDelta(t, 1.5, p.retryConfig.Multiplier, 0.0001)
+	assert.Equal(t, retry.JitterNone, p.retryConfig.Jitter)
+}
+
+func TestNewProvider_AppliesCustomHTTPConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"http": map[string]any{
+					"tls_handshake_timeout":   "123ms",
+					"response_header_timeout": "456ms",
+					"idle_conn_timeout":       "789ms",
+				},
+			},
+		},
+	}
+
+	var capturedAPIKey string
+	var capturedHTTPClient *http.Client
+
+	oldFactory := newAnthropicClient
+	newAnthropicClient = func(apiKey string, httpClient *http.Client) anthropic.Client {
+		capturedAPIKey = apiKey
+		capturedHTTPClient = httpClient
+
+		return anthropic.Client{}
+	}
+	defer func() {
+		newAnthropicClient = oldFactory
+	}()
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{APIKey: "test-key"})
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "test-key", capturedAPIKey)
+	require.NotNil(t, capturedHTTPClient)
+
+	transport, ok := capturedHTTPClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Equal(t, 123*time.Millisecond, transport.TLSHandshakeTimeout)
+	assert.Equal(t, 456*time.Millisecond, transport.ResponseHeaderTimeout)
+	assert.Equal(t, 789*time.Millisecond, transport.IdleConnTimeout)
+}
+
+func TestNewProvider_InvalidRetryConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"retry": map[string]any{
+					"base_delay": "not-a-duration",
+				},
+			},
+		},
+	}
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{APIKey: "test-key"})
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Contains(t, err.Error(), "provider anthropic")
+	assert.Contains(t, err.Error(), "invalid base_delay")
+}
+
+func TestNewProvider_InvalidHTTPConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"http": map[string]any{
+					"dial_timeout": "not-a-duration",
+				},
+			},
+		},
+	}
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{APIKey: "test-key"})
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Contains(t, err.Error(), "provider anthropic")
+	assert.Contains(t, err.Error(), "invalid dial_timeout")
 }
 
 func collectEvents(t *testing.T, ch <-chan sdk.ProviderEvent) []sdk.ProviderEvent {
@@ -502,6 +673,299 @@ func TestStream_RetryOn429(t *testing.T) {
 
 	assert.Equal(t, []string{"Hello after retry!"}, textDeltas)
 	assert.Equal(t, 3, attemptCount, "expected 3 attempts (2 failures + 1 success)")
+}
+
+func TestStream_ConfiguredZeroRetryDisablesSDKRetries(t *testing.T) {
+	attemptCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`)
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 0,
+		BaseDelay:  1 * time.Millisecond,
+		MaxDelay:   1 * time.Millisecond,
+		Multiplier: 1,
+		Jitter:     retry.JitterNone,
+	}
+
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var errorMsgs []string
+
+	for _, evt := range events {
+		if evt.Type == sdk.ProviderEventError {
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	require.NotEmpty(t, errorMsgs)
+	assert.Contains(t, errorMsgs[len(errorMsgs)-1], "max retries exceeded (0)")
+	assert.Equal(t, 1, attemptCount)
+}
+
+func TestStream_UsesConfiguredRetryConfig(t *testing.T) {
+	attemptCount := 0
+	partialEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		writeSSEAndClose(w, partialEvents)
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 0,
+		BaseDelay:  1 * time.Millisecond,
+		MaxDelay:   1 * time.Millisecond,
+		Multiplier: 1,
+		Jitter:     retry.JitterNone,
+	}
+
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var errorMsgs []string
+
+	for _, evt := range events {
+		if evt.Type == sdk.ProviderEventError {
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	require.NotEmpty(t, errorMsgs)
+	assert.Contains(t, errorMsgs[len(errorMsgs)-1], "max retries exceeded (0)")
+	assert.Equal(t, 1, attemptCount)
+}
+
+func TestStream_UsesConfiguredRetryDelay(t *testing.T) {
+	var logs bytes.Buffer
+
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(oldLogger)
+
+	attemptCount := 0
+	partialEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount <= 2 {
+			writeSSEAndClose(w, partialEvents)
+			return
+		}
+
+		writeSSE(w, textStreamEvents("ok"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 2,
+		BaseDelay:  7 * time.Millisecond,
+		MaxDelay:   10 * time.Millisecond,
+		Multiplier: 2,
+		Jitter:     retry.JitterNone,
+	}
+
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+	collectEvents(t, ch)
+
+	got := logs.String()
+	assert.Contains(t, got, `"delay":"7ms"`)
+	assert.Contains(t, got, `"delay":"10ms"`)
+	assert.Equal(t, 3, attemptCount)
+}
+
+func thinkingAndTextStreamEvents(thinking, text string) []sseEvent {
+	return []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`},
+		{EventType: "content_block_delta", Data: fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`, thinking)},
+		{EventType: "content_block_stop", Data: `{"type":"content_block_stop","index":0}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: fmt.Sprintf(`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":%q}}`, text)},
+		{EventType: "content_block_stop", Data: `{"type":"content_block_stop","index":1}`},
+		{EventType: "message_delta", Data: `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}`},
+		{EventType: "message_stop", Data: `{"type":"message_stop"}`},
+	}
+}
+
+func writeSSEAndClose(w http.ResponseWriter, events []sseEvent) {
+	flusher := w.(http.Flusher)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	for _, evt := range events {
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.EventType, evt.Data)
+		flusher.Flush()
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err == nil {
+		_ = conn.Close()
+	}
+}
+
+func TestStream_DeduplicatesTextAndThinkingAfterRetry(t *testing.T) {
+	attemptCount := 0
+
+	firstAttemptEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}`},
+		{EventType: "content_block_stop", Data: `{"type":"content_block_stop","index":0}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hel"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount == 1 {
+			writeSSEAndClose(w, firstAttemptEvents)
+			return
+		}
+
+		writeSSE(w, thinkingAndTextStreamEvents("plan next", "Hello"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Think then answer")},
+	}, model.WithThinkingLevel(model.ThinkingMedium))
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var thinkingDeltas, textDeltas, errorMsgs []string
+
+	for _, evt := range events {
+		switch evt.Type {
+		case sdk.ProviderEventThinking:
+			thinkingDeltas = append(thinkingDeltas, evt.Content.(string))
+		case sdk.ProviderEventTextDelta:
+			textDeltas = append(textDeltas, evt.Content.(string))
+		case sdk.ProviderEventError:
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	assert.Empty(t, errorMsgs)
+	assert.Equal(t, []string{"plan", " next"}, thinkingDeltas)
+	assert.Equal(t, []string{"Hel", "lo"}, textDeltas)
+	assert.Equal(t, 2, attemptCount)
+}
+
+func TestStream_ErrorsWhenSuccessfulRetryIsShorterThanEmittedText(t *testing.T) {
+	attemptCount := 0
+
+	firstAttemptEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello world"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount == 1 {
+			writeSSEAndClose(w, firstAttemptEvents)
+			return
+		}
+
+		writeSSE(w, textStreamEvents("Hello"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var errorMsgs []string
+
+	for _, evt := range events {
+		if evt.Type == sdk.ProviderEventError {
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	require.NotEmpty(t, errorMsgs)
+	assert.Contains(t, errorMsgs[len(errorMsgs)-1], "stream diverged after retry")
+	assert.Equal(t, 2, attemptCount)
+}
+
+func TestStream_RetryDebugLogUsesSafeFields(t *testing.T) {
+	var logs bytes.Buffer
+
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(oldLogger)
+
+	attemptCount := 0
+	partialEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"secret response body"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount == 1 {
+			writeSSEAndClose(w, partialEvents)
+			return
+		}
+
+		writeSSE(w, textStreamEvents("ok"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		SystemPrompt: "secret system prompt",
+		Messages:     []sdk.Message{sdk.NewUserMessage("secret user prompt")},
+	})
+	require.NoError(t, err)
+	collectEvents(t, ch)
+
+	got := logs.String()
+	assert.Contains(t, got, "anthropic stream retry")
+	assert.Contains(t, got, `"attempt":1`)
+	assert.Contains(t, got, `"max_retries":2`)
+	assert.NotContains(t, got, "test-key")
+	assert.NotContains(t, got, "secret system prompt")
+	assert.NotContains(t, got, "secret user prompt")
+	assert.NotContains(t, got, "secret response body")
 }
 
 func TestRegister(t *testing.T) {
