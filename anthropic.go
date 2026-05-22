@@ -16,6 +16,8 @@ import (
 
 	"github.com/weave-agent/weave/sdk"
 	"github.com/weave-agent/weave/sdk/model"
+	"github.com/weave-agent/weave/sdk/providerhttp"
+	"github.com/weave-agent/weave/sdk/providerretry"
 	"github.com/weave-agent/weave/sdk/retry"
 )
 
@@ -36,9 +38,10 @@ type AuthConfig struct {
 }
 
 type provider struct {
-	client    anthropic.Client
-	model     string
-	maxTokens int
+	client      anthropic.Client
+	model       string
+	maxTokens   int
+	retryConfig retry.Config
 }
 
 // retryConfig controls retry behavior for stream requests. It is a variable so
@@ -46,21 +49,35 @@ type provider struct {
 var retryConfig = retry.DefaultConfig()
 
 func init() {
-	sdk.RegisterProvider[AnthropicConfig, AuthConfig]("anthropic", func(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider, error) {
-		if a.APIKey == "" {
-			return nil, errors.New("anthropic: API key required (set ANTHROPIC_API_KEY)")
-		}
+	sdk.RegisterProvider[AnthropicConfig, AuthConfig]("anthropic", newProvider)
+}
 
-		apiKey := a.APIKey
+func newProvider(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider, error) {
+	if a.APIKey == "" {
+		return nil, errors.New("anthropic: API key required (set ANTHROPIC_API_KEY)")
+	}
 
-		client := anthropic.NewClient(option.WithAPIKey(apiKey))
+	httpClient, _, err := providerhttp.ForProvider(cfg, "anthropic")
+	if err != nil {
+		return nil, err
+	}
 
-		return &provider{
-			client:    client,
-			model:     ac.Model,
-			maxTokens: ac.MaxTokens,
-		}, nil
-	})
+	retryCfg, _, err := providerretry.ForProvider(cfg, "anthropic")
+	if err != nil {
+		return nil, err
+	}
+
+	client := anthropic.NewClient(
+		option.WithAPIKey(a.APIKey),
+		option.WithHTTPClient(httpClient),
+	)
+
+	return &provider{
+		client:      client,
+		model:       ac.Model,
+		maxTokens:   ac.MaxTokens,
+		retryConfig: retryCfg,
+	}, nil
 }
 
 // NewProviderWithClient creates a provider with a pre-configured client (for testing).
@@ -69,7 +86,7 @@ func NewProviderWithClient(client anthropic.Client, modelName string) sdk.Provid
 		modelName = defaultModel
 	}
 
-	return &provider{client: client, model: modelName, maxTokens: defaultMaxTokens}
+	return &provider{client: client, model: modelName, maxTokens: defaultMaxTokens, retryConfig: retryConfig}
 }
 
 func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...model.StreamOption) (<-chan sdk.ProviderEvent, error) {
@@ -105,7 +122,7 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 			seenToolCalls: make(map[string]bool),
 		}
 
-		cfg := retryConfig
+		cfg := p.retryConfig
 
 		var lastErr error
 

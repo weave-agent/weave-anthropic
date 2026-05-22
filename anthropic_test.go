@@ -99,6 +99,87 @@ func newTestProvider(server *httptest.Server) sdk.Provider {
 	return NewProviderWithClient(client, "claude-sonnet-4-6")
 }
 
+type providerConfigStub struct {
+	providers map[string]map[string]any
+	sdk.NoopConfig
+}
+
+func (s *providerConfigStub) ExtensionConfig(scope, name string, target any) error {
+	if scope != "providers" {
+		return fmt.Errorf("unknown scope %q", scope)
+	}
+
+	section, ok := s.providers[name]
+	if !ok {
+		return nil
+	}
+
+	data, err := json.Marshal(section)
+	if err != nil {
+		return fmt.Errorf("marshal stub config: %w", err)
+	}
+
+	if err := json.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("unmarshal stub config: %w", err)
+	}
+
+	return nil
+}
+
+func TestNewProvider_CustomRetryConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"retry": map[string]any{
+					"max_retries": 3,
+					"base_delay":  "250ms",
+					"max_delay":   "2s",
+					"multiplier":  1.5,
+					"jitter":      "none",
+				},
+			},
+		},
+	}
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     "claude-opus-4-1",
+		MaxTokens: 2048,
+	}, AuthConfig{APIKey: "test-key"})
+	require.NoError(t, err)
+
+	p, ok := got.(*provider)
+	require.True(t, ok)
+
+	assert.Equal(t, "claude-opus-4-1", p.model)
+	assert.Equal(t, 2048, p.maxTokens)
+	assert.Equal(t, 3, p.retryConfig.MaxRetries)
+	assert.Equal(t, 250*time.Millisecond, p.retryConfig.BaseDelay)
+	assert.Equal(t, 2*time.Second, p.retryConfig.MaxDelay)
+	assert.InDelta(t, 1.5, p.retryConfig.Multiplier, 0.0001)
+	assert.Equal(t, retry.JitterNone, p.retryConfig.Jitter)
+}
+
+func TestNewProvider_InvalidRetryConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"retry": map[string]any{
+					"base_delay": "not-a-duration",
+				},
+			},
+		},
+	}
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{APIKey: "test-key"})
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Contains(t, err.Error(), "provider anthropic")
+	assert.Contains(t, err.Error(), "invalid base_delay")
+}
+
 func collectEvents(t *testing.T, ch <-chan sdk.ProviderEvent) []sdk.ProviderEvent {
 	t.Helper()
 

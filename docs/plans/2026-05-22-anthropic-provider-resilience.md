@@ -45,13 +45,13 @@ Apply shared provider retry SDK support to Anthropic and configure provider HTTP
 ## Implementation Steps
 
 ### Task 1: Wire Anthropic provider runtime configuration
-- [ ] update provider initialization to resolve `providerretry.ForProvider(cfg, "anthropic")`
-- [ ] configure SDK HTTP behavior from `providerhttp` if the SDK exposes a clean custom client or timeout option
-- [ ] store retry config in provider runtime state
-- [ ] preserve existing API key, model, and max token behavior
-- [ ] write tests for provider init with custom retry config
-- [ ] write tests for invalid retry config failing provider init
-- [ ] run `go test ./...` - must pass before next task
+- [x] update provider initialization to resolve `providerretry.ForProvider(cfg, "anthropic")`
+- [x] configure SDK HTTP behavior from `providerhttp` if the SDK exposes a clean custom client or timeout option
+- [x] store retry config in provider runtime state
+- [x] preserve existing API key, model, and max token behavior
+- [x] write tests for provider init with custom retry config
+- [x] write tests for invalid retry config failing provider init
+- [x] run `go test ./...` - must pass before next task
 
 ### Task 2: Preserve retry and dedupe semantics
 - [ ] replace runtime use of package-global retry defaults with provider runtime retry config
