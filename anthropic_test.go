@@ -183,6 +183,27 @@ func TestNewProvider_InvalidRetryConfig(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid base_delay")
 }
 
+func TestNewProvider_InvalidHTTPConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"http": map[string]any{
+					"dial_timeout": "not-a-duration",
+				},
+			},
+		},
+	}
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{APIKey: "test-key"})
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Contains(t, err.Error(), "provider anthropic")
+	assert.Contains(t, err.Error(), "invalid dial_timeout")
+}
+
 func collectEvents(t *testing.T, ch <-chan sdk.ProviderEvent) []sdk.ProviderEvent {
 	t.Helper()
 

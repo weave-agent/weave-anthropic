@@ -63,10 +63,10 @@ Apply shared provider retry SDK support to Anthropic and configure provider HTTP
 - [x] run `go test ./...` - must pass before next task
 
 ### Task 3: Verify acceptance criteria
-- [ ] verify Anthropic retry uses provider config, not package-global runtime defaults
-- [ ] verify invalid provider HTTP/retry config fails provider initialization
-- [ ] verify retry debug logs exclude secrets, prompts, request bodies, and response bodies
-- [ ] run `go test ./...`
+- [x] verify Anthropic retry uses provider config, not package-global runtime defaults
+- [x] verify invalid provider HTTP/retry config fails provider initialization
+- [x] verify retry debug logs exclude secrets, prompts, request bodies, and response bodies
+- [x] run `go test ./...`
 
 ## Technical Details
 Anthropic HTTP client configuration depends on Anthropic SDK support. If the SDK cannot accept a custom HTTP client cleanly, record the limitation in this plan and still apply shared retry config.
