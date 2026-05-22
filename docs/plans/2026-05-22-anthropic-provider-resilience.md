@@ -69,7 +69,7 @@ Apply shared provider retry SDK support to Anthropic and configure provider HTTP
 - [x] run `go test ./...`
 
 ## Technical Details
-Anthropic HTTP client configuration depends on Anthropic SDK support. If the SDK cannot accept a custom HTTP client cleanly, record the limitation in this plan and still apply shared retry config.
+Anthropic SDK supports custom HTTP clients through `option.WithHTTPClient`, so provider HTTP settings from `providerhttp.ForProvider(cfg, "anthropic")` are applied during client construction.
 
 ## Post-Completion
 Manual verification:

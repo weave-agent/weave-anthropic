@@ -129,6 +129,28 @@ func (s *providerConfigStub) ExtensionConfig(scope, name string, target any) err
 	return nil
 }
 
+type failOnConfigLookup struct {
+	sdk.NoopConfig
+	t *testing.T
+}
+
+func (s failOnConfigLookup) ExtensionConfig(scope, name string, target any) error {
+	s.t.Helper()
+	s.t.Fatalf("ExtensionConfig(%q, %q) should not be called", scope, name)
+
+	return nil
+}
+
+func TestNewProvider_MissingAPIKey(t *testing.T) {
+	got, err := newProvider(failOnConfigLookup{t: t}, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{})
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.Contains(t, err.Error(), "API key required")
+}
+
 func TestNewProvider_CustomRetryConfig(t *testing.T) {
 	cfg := &providerConfigStub{
 		providers: map[string]map[string]any{
@@ -160,6 +182,49 @@ func TestNewProvider_CustomRetryConfig(t *testing.T) {
 	assert.Equal(t, 2*time.Second, p.retryConfig.MaxDelay)
 	assert.InDelta(t, 1.5, p.retryConfig.Multiplier, 0.0001)
 	assert.Equal(t, retry.JitterNone, p.retryConfig.Jitter)
+}
+
+func TestNewProvider_AppliesCustomHTTPConfig(t *testing.T) {
+	cfg := &providerConfigStub{
+		providers: map[string]map[string]any{
+			"anthropic": {
+				"http": map[string]any{
+					"tls_handshake_timeout":   "123ms",
+					"response_header_timeout": "456ms",
+					"idle_conn_timeout":       "789ms",
+				},
+			},
+		},
+	}
+
+	var capturedAPIKey string
+	var capturedHTTPClient *http.Client
+
+	oldFactory := newAnthropicClient
+	newAnthropicClient = func(apiKey string, httpClient *http.Client) anthropic.Client {
+		capturedAPIKey = apiKey
+		capturedHTTPClient = httpClient
+
+		return anthropic.Client{}
+	}
+	defer func() {
+		newAnthropicClient = oldFactory
+	}()
+
+	got, err := newProvider(cfg, AnthropicConfig{
+		Model:     defaultModel,
+		MaxTokens: defaultMaxTokens,
+	}, AuthConfig{APIKey: "test-key"})
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "test-key", capturedAPIKey)
+	require.NotNil(t, capturedHTTPClient)
+
+	transport, ok := capturedHTTPClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Equal(t, 123*time.Millisecond, transport.TLSHandshakeTimeout)
+	assert.Equal(t, 456*time.Millisecond, transport.ResponseHeaderTimeout)
+	assert.Equal(t, 789*time.Millisecond, transport.IdleConnTimeout)
 }
 
 func TestNewProvider_InvalidRetryConfig(t *testing.T) {
@@ -650,6 +715,52 @@ func TestStream_UsesConfiguredRetryConfig(t *testing.T) {
 	require.NotEmpty(t, errorMsgs)
 	assert.Contains(t, errorMsgs[len(errorMsgs)-1], "max retries exceeded (0)")
 	assert.Equal(t, 1, attemptCount)
+}
+
+func TestStream_UsesConfiguredRetryDelay(t *testing.T) {
+	var logs bytes.Buffer
+
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(oldLogger)
+
+	attemptCount := 0
+	partialEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount <= 2 {
+			writeSSEAndClose(w, partialEvents)
+			return
+		}
+
+		writeSSE(w, textStreamEvents("ok"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 2,
+		BaseDelay:  7 * time.Millisecond,
+		MaxDelay:   10 * time.Millisecond,
+		Multiplier: 2,
+		Jitter:     retry.JitterNone,
+	}
+
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+	collectEvents(t, ch)
+
+	got := logs.String()
+	assert.Contains(t, got, `"delay":"7ms"`)
+	assert.Contains(t, got, `"delay":"10ms"`)
+	assert.Equal(t, 3, attemptCount)
 }
 
 func thinkingAndTextStreamEvents(thinking, text string) []sseEvent {

@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
@@ -43,11 +43,17 @@ type provider struct {
 	model       string
 	maxTokens   int
 	retryConfig retry.Config
-	logger      *slog.Logger
 }
 
 func init() {
 	sdk.RegisterProvider[AnthropicConfig, AuthConfig]("anthropic", newProvider)
+}
+
+var newAnthropicClient = func(apiKey string, httpClient *http.Client) anthropic.Client {
+	return anthropic.NewClient(
+		option.WithAPIKey(apiKey),
+		option.WithHTTPClient(httpClient),
+	)
 }
 
 func newProvider(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider, error) {
@@ -65,17 +71,11 @@ func newProvider(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider
 		return nil, err
 	}
 
-	client := anthropic.NewClient(
-		option.WithAPIKey(a.APIKey),
-		option.WithHTTPClient(httpClient),
-	)
-
 	return &provider{
-		client:      client,
+		client:      newAnthropicClient(a.APIKey, httpClient),
 		model:       ac.Model,
 		maxTokens:   ac.MaxTokens,
 		retryConfig: retryCfg,
-		logger:      sdk.Logger("anthropic"),
 	}, nil
 }
 
@@ -90,7 +90,6 @@ func NewProviderWithClient(client anthropic.Client, modelName string) sdk.Provid
 		model:       modelName,
 		maxTokens:   defaultMaxTokens,
 		retryConfig: retry.DefaultConfig(),
-		logger:      sdk.Logger("anthropic"),
 	}
 }
 
@@ -128,19 +127,23 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 		}
 
 		cfg := p.retryConfig
-		logger := p.logger
-		if logger == nil {
-			logger = sdk.Logger("anthropic")
-		}
 
 		var lastErr error
-		var retryDelay time.Duration
 
 		success := false
 
 		for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 			if attempt > 0 {
-				timer := time.NewTimer(retryDelay)
+				delay := retry.JitteredDelay(retry.CalculateDelay(cfg, attempt-1), cfg.Jitter)
+				sdk.Logger("anthropic").Debug("anthropic stream retry",
+					"attempt", attempt,
+					"next_attempt", attempt+1,
+					"max_retries", cfg.MaxRetries,
+					"delay", delay.String(),
+					"error_type", fmt.Sprintf("%T", lastErr),
+				)
+
+				timer := time.NewTimer(delay)
 
 				select {
 				case <-timer.C:
@@ -198,16 +201,6 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 				}
 
 				lastErr = err
-				if attempt < cfg.MaxRetries {
-					retryDelay = retry.JitteredDelay(retry.CalculateDelay(cfg, attempt), cfg.Jitter)
-					logger.Debug("anthropic stream retry",
-						"attempt", attempt+1,
-						"next_attempt", attempt+2,
-						"max_retries", cfg.MaxRetries,
-						"delay", retryDelay.String(),
-						"error_type", fmt.Sprintf("%T", err),
-					)
-				}
 
 				continue
 			}
