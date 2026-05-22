@@ -54,13 +54,13 @@ Apply shared provider retry SDK support to Anthropic and configure provider HTTP
 - [x] run `go test ./...` - must pass before next task
 
 ### Task 2: Preserve retry and dedupe semantics
-- [ ] replace runtime use of package-global retry defaults with provider runtime retry config
-- [ ] keep existing stream accumulator behavior for retried partial streams
-- [ ] apply configured jittered retry delay in Anthropic retry loop
-- [ ] add debug logging for retry attempts with safe fields only
-- [ ] update existing retry tests to use configured retry values
-- [ ] write tests for no duplicate text/thinking after retry
-- [ ] run `go test ./...` - must pass before next task
+- [x] replace runtime use of package-global retry defaults with provider runtime retry config
+- [x] keep existing stream accumulator behavior for retried partial streams
+- [x] apply configured jittered retry delay in Anthropic retry loop
+- [x] add debug logging for retry attempts with safe fields only
+- [x] update existing retry tests to use configured retry values
+- [x] write tests for no duplicate text/thinking after retry
+- [x] run `go test ./...` - must pass before next task
 
 ### Task 3: Verify acceptance criteria
 - [ ] verify Anthropic retry uses provider config, not package-global runtime defaults

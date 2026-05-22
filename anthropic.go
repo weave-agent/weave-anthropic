@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"slices"
@@ -42,11 +43,8 @@ type provider struct {
 	model       string
 	maxTokens   int
 	retryConfig retry.Config
+	logger      *slog.Logger
 }
-
-// retryConfig controls retry behavior for stream requests. It is a variable so
-// tests can override it with faster settings.
-var retryConfig = retry.DefaultConfig()
 
 func init() {
 	sdk.RegisterProvider[AnthropicConfig, AuthConfig]("anthropic", newProvider)
@@ -77,6 +75,7 @@ func newProvider(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider
 		model:       ac.Model,
 		maxTokens:   ac.MaxTokens,
 		retryConfig: retryCfg,
+		logger:      sdk.Logger("anthropic"),
 	}, nil
 }
 
@@ -86,7 +85,13 @@ func NewProviderWithClient(client anthropic.Client, modelName string) sdk.Provid
 		modelName = defaultModel
 	}
 
-	return &provider{client: client, model: modelName, maxTokens: defaultMaxTokens, retryConfig: retryConfig}
+	return &provider{
+		client:      client,
+		model:       modelName,
+		maxTokens:   defaultMaxTokens,
+		retryConfig: retry.DefaultConfig(),
+		logger:      sdk.Logger("anthropic"),
+	}
 }
 
 func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...model.StreamOption) (<-chan sdk.ProviderEvent, error) {
@@ -123,15 +128,19 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 		}
 
 		cfg := p.retryConfig
+		logger := p.logger
+		if logger == nil {
+			logger = sdk.Logger("anthropic")
+		}
 
 		var lastErr error
+		var retryDelay time.Duration
 
 		success := false
 
 		for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 			if attempt > 0 {
-				delay := retry.CalculateDelay(cfg, attempt-1)
-				timer := time.NewTimer(delay)
+				timer := time.NewTimer(retryDelay)
 
 				select {
 				case <-timer.C:
@@ -189,6 +198,16 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 				}
 
 				lastErr = err
+				if attempt < cfg.MaxRetries {
+					retryDelay = retry.JitteredDelay(retry.CalculateDelay(cfg, attempt), cfg.Jitter)
+					logger.Debug("anthropic stream retry",
+						"attempt", attempt+1,
+						"next_attempt", attempt+2,
+						"max_retries", cfg.MaxRetries,
+						"delay", retryDelay.String(),
+						"error_type", fmt.Sprintf("%T", err),
+					)
+				}
 
 				continue
 			}
@@ -379,7 +398,7 @@ func isRetriableError(err error) bool {
 		return true
 	}
 
-	if strings.Contains(msgLower, "timeout") || strings.Contains(msgLower, "deadline exceeded") {
+	if strings.Contains(msgLower, "timeout") || strings.Contains(msgLower, "deadline exceeded") || strings.Contains(msgLower, "eof") {
 		return true
 	}
 

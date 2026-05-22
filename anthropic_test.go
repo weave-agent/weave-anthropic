@@ -1,12 +1,13 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,15 +22,14 @@ import (
 	"github.com/weave-agent/weave/sdk/retry"
 )
 
-func TestMain(m *testing.M) {
-	retryConfig = retry.Config{
+func fastRetryConfig() retry.Config {
+	return retry.Config{
 		MaxRetries: 2,
 		BaseDelay:  1 * time.Millisecond,
 		MaxDelay:   10 * time.Millisecond,
 		Multiplier: 2,
+		Jitter:     retry.JitterNone,
 	}
-
-	os.Exit(m.Run())
 }
 
 type sseEvent struct {
@@ -96,7 +96,10 @@ func newTestProvider(server *httptest.Server) sdk.Provider {
 		option.WithBaseURL(server.URL),
 	)
 
-	return NewProviderWithClient(client, "claude-sonnet-4-6")
+	p := NewProviderWithClient(client, "claude-sonnet-4-6").(*provider)
+	p.retryConfig = fastRetryConfig()
+
+	return p
 }
 
 type providerConfigStub struct {
@@ -583,6 +586,173 @@ func TestStream_RetryOn429(t *testing.T) {
 
 	assert.Equal(t, []string{"Hello after retry!"}, textDeltas)
 	assert.Equal(t, 3, attemptCount, "expected 3 attempts (2 failures + 1 success)")
+}
+
+func TestStream_UsesConfiguredRetryConfig(t *testing.T) {
+	attemptCount := 0
+	partialEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		writeSSEAndClose(w, partialEvents)
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 0,
+		BaseDelay:  1 * time.Millisecond,
+		MaxDelay:   1 * time.Millisecond,
+		Multiplier: 1,
+		Jitter:     retry.JitterNone,
+	}
+
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var errorMsgs []string
+
+	for _, evt := range events {
+		if evt.Type == sdk.ProviderEventError {
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	require.NotEmpty(t, errorMsgs)
+	assert.Contains(t, errorMsgs[len(errorMsgs)-1], "max retries exceeded (0)")
+	assert.Equal(t, 1, attemptCount)
+}
+
+func thinkingAndTextStreamEvents(thinking, text string) []sseEvent {
+	return []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`},
+		{EventType: "content_block_delta", Data: fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":%q}}`, thinking)},
+		{EventType: "content_block_stop", Data: `{"type":"content_block_stop","index":0}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: fmt.Sprintf(`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":%q}}`, text)},
+		{EventType: "content_block_stop", Data: `{"type":"content_block_stop","index":1}`},
+		{EventType: "message_delta", Data: `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}`},
+		{EventType: "message_stop", Data: `{"type":"message_stop"}`},
+	}
+}
+
+func writeSSEAndClose(w http.ResponseWriter, events []sseEvent) {
+	flusher := w.(http.Flusher)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	for _, evt := range events {
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.EventType, evt.Data)
+		flusher.Flush()
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err == nil {
+		_ = conn.Close()
+	}
+}
+
+func TestStream_DeduplicatesTextAndThinkingAfterRetry(t *testing.T) {
+	attemptCount := 0
+
+	firstAttemptEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}`},
+		{EventType: "content_block_stop", Data: `{"type":"content_block_stop","index":0}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hel"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount == 1 {
+			writeSSEAndClose(w, firstAttemptEvents)
+			return
+		}
+
+		writeSSE(w, thinkingAndTextStreamEvents("plan next", "Hello"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Think then answer")},
+	}, model.WithThinkingLevel(model.ThinkingMedium))
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var thinkingDeltas, textDeltas, errorMsgs []string
+
+	for _, evt := range events {
+		switch evt.Type {
+		case sdk.ProviderEventThinking:
+			thinkingDeltas = append(thinkingDeltas, evt.Content.(string))
+		case sdk.ProviderEventTextDelta:
+			textDeltas = append(textDeltas, evt.Content.(string))
+		case sdk.ProviderEventError:
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	assert.Empty(t, errorMsgs)
+	assert.Equal(t, []string{"plan", " next"}, thinkingDeltas)
+	assert.Equal(t, []string{"Hel", "lo"}, textDeltas)
+	assert.Equal(t, 2, attemptCount)
+}
+
+func TestStream_RetryDebugLogUsesSafeFields(t *testing.T) {
+	var logs bytes.Buffer
+
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(oldLogger)
+
+	attemptCount := 0
+	partialEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"secret response body"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount == 1 {
+			writeSSEAndClose(w, partialEvents)
+			return
+		}
+
+		writeSSE(w, textStreamEvents("ok"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		SystemPrompt: "secret system prompt",
+		Messages:     []sdk.Message{sdk.NewUserMessage("secret user prompt")},
+	})
+	require.NoError(t, err)
+	collectEvents(t, ch)
+
+	got := logs.String()
+	assert.Contains(t, got, "anthropic stream retry")
+	assert.Contains(t, got, `"attempt":1`)
+	assert.Contains(t, got, `"max_retries":2`)
+	assert.NotContains(t, got, "test-key")
+	assert.NotContains(t, got, "secret system prompt")
+	assert.NotContains(t, got, "secret user prompt")
+	assert.NotContains(t, got, "secret response body")
 }
 
 func TestRegister(t *testing.T) {
