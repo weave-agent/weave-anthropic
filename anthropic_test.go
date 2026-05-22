@@ -94,6 +94,7 @@ func newTestProvider(server *httptest.Server) sdk.Provider {
 	client := anthropic.NewClient(
 		option.WithAPIKey("test-key"),
 		option.WithBaseURL(server.URL),
+		option.WithMaxRetries(0),
 	)
 
 	p := NewProviderWithClient(client, "claude-sonnet-4-6").(*provider)
@@ -674,6 +675,45 @@ func TestStream_RetryOn429(t *testing.T) {
 	assert.Equal(t, 3, attemptCount, "expected 3 attempts (2 failures + 1 success)")
 }
 
+func TestStream_ConfiguredZeroRetryDisablesSDKRetries(t *testing.T) {
+	attemptCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`)
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 0,
+		BaseDelay:  1 * time.Millisecond,
+		MaxDelay:   1 * time.Millisecond,
+		Multiplier: 1,
+		Jitter:     retry.JitterNone,
+	}
+
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var errorMsgs []string
+
+	for _, evt := range events {
+		if evt.Type == sdk.ProviderEventError {
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	require.NotEmpty(t, errorMsgs)
+	assert.Contains(t, errorMsgs[len(errorMsgs)-1], "max retries exceeded (0)")
+	assert.Equal(t, 1, attemptCount)
+}
+
 func TestStream_UsesConfiguredRetryConfig(t *testing.T) {
 	attemptCount := 0
 	partialEvents := []sseEvent{
@@ -841,6 +881,47 @@ func TestStream_DeduplicatesTextAndThinkingAfterRetry(t *testing.T) {
 	assert.Empty(t, errorMsgs)
 	assert.Equal(t, []string{"plan", " next"}, thinkingDeltas)
 	assert.Equal(t, []string{"Hel", "lo"}, textDeltas)
+	assert.Equal(t, 2, attemptCount)
+}
+
+func TestStream_ErrorsWhenSuccessfulRetryIsShorterThanEmittedText(t *testing.T) {
+	attemptCount := 0
+
+	firstAttemptEvents := []sseEvent{
+		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
+		{EventType: "content_block_start", Data: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		{EventType: "content_block_delta", Data: `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello world"}}`},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount == 1 {
+			writeSSEAndClose(w, firstAttemptEvents)
+			return
+		}
+
+		writeSSE(w, textStreamEvents("Hello"))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server)
+	ch, err := p.Stream(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+
+	events := collectEvents(t, ch)
+
+	var errorMsgs []string
+
+	for _, evt := range events {
+		if evt.Type == sdk.ProviderEventError {
+			errorMsgs = append(errorMsgs, evt.Content.(string))
+		}
+	}
+
+	require.NotEmpty(t, errorMsgs)
+	assert.Contains(t, errorMsgs[len(errorMsgs)-1], "stream diverged after retry")
 	assert.Equal(t, 2, attemptCount)
 }
 

@@ -53,6 +53,7 @@ var newAnthropicClient = func(apiKey string, httpClient *http.Client) anthropic.
 	return anthropic.NewClient(
 		option.WithAPIKey(apiKey),
 		option.WithHTTPClient(httpClient),
+		option.WithMaxRetries(0),
 	)
 }
 
@@ -205,6 +206,10 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 				continue
 			}
 
+			if !acc.validateCompletedTotals(curText.String(), curThinking.String(), send) {
+				return
+			}
+
 			success = true
 
 			emitContentBlocksWithAccumulator(message.Content, acc, send)
@@ -292,6 +297,23 @@ func (a *streamAccumulator) emitThinkingIfNew(curTotal string, send func(sdk.Pro
 	})
 
 	return false
+}
+
+func (a *streamAccumulator) validateCompletedTotals(curText, curThinking string, send func(sdk.ProviderEvent) bool) bool {
+	if !completedTotalCoversEmitted(a.text.String(), curText) || !completedTotalCoversEmitted(a.thinking.String(), curThinking) {
+		send(sdk.ProviderEvent{
+			Type:    sdk.ProviderEventError,
+			Content: "anthropic: stream diverged after retry",
+		})
+
+		return false
+	}
+
+	return true
+}
+
+func completedTotalCoversEmitted(emitted, completed string) bool {
+	return len(emitted) <= len(completed) && strings.HasPrefix(completed, emitted)
 }
 
 func (a *streamAccumulator) emitThinkingDone(st sdk.SignedThinking, send func(sdk.ProviderEvent) bool) bool {
