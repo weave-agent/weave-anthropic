@@ -1047,6 +1047,102 @@ func TestStream_WithModelOverride(t *testing.T) {
 	assert.Contains(t, receivedBody, "claude-opus-4-7")
 }
 
+func TestStream_RequestParamsMatchSharedBuilder(t *testing.T) {
+	model.ResetModelRegistry()
+	defer model.ResetModelRegistry()
+
+	RegisterModels()
+
+	var receivedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(buf)
+		receivedBody = string(buf)
+
+		writeSSE(w, textStreamEvents("response"))
+	}))
+	defer server.Close()
+
+	req := sdk.ProviderRequest{
+		SystemPrompt: "You are a helpful assistant.",
+		Messages: []sdk.Message{
+			sdk.NewUserMessage("Use the tool"),
+		},
+		Tools: []sdk.ToolDef{
+			{
+				Name:        "bash",
+				Description: "Run a bash command",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string"},
+					},
+					"required": []string{"command"},
+				},
+			},
+		},
+	}
+
+	p := newTestProvider(server).(*provider)
+	ch, err := p.Stream(
+		context.Background(),
+		req,
+		model.WithModel("claude-opus-4-7"),
+		model.WithMaxTokens(4096),
+		model.WithThinkingLevel(model.ThinkingXHigh),
+	)
+	require.NoError(t, err)
+	collectEvents(t, ch)
+
+	expectedParams := p.buildParams(req, "claude-opus-4-7", 4096, model.ThinkingXHigh)
+	expectedBody, err := json.Marshal(expectedParams)
+	require.NoError(t, err)
+
+	var expected map[string]any
+	require.NoError(t, json.Unmarshal(expectedBody, &expected))
+	expected["stream"] = true
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(receivedBody), &body))
+	assert.Equal(t, expected, body)
+
+	assert.Equal(t, "claude-opus-4-7", body["model"])
+	assert.Equal(t, float64(4096), body["max_tokens"])
+
+	system := body["system"].([]any)
+	cacheControl := system[0].(map[string]any)["cache_control"].(map[string]any)
+	assert.Equal(t, "ephemeral", cacheControl["type"])
+
+	tools := body["tools"].([]any)
+	assert.Equal(t, "bash", tools[0].(map[string]any)["name"])
+}
+
+func TestBuildRequestParams_ClampsThinkingLevel(t *testing.T) {
+	model.ResetModelRegistry()
+	defer model.ResetModelRegistry()
+
+	RegisterModels()
+
+	p := &provider{}
+	req := sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("think")},
+	}
+
+	sonnetParams := p.buildRequestParams(req, "claude-sonnet-4-6", model.ThinkingXHigh).messageNewParams(defaultMaxTokens)
+	sonnetBody, err := json.Marshal(sonnetParams)
+	require.NoError(t, err)
+	assert.Contains(t, string(sonnetBody), `"thinking"`)
+	assert.Contains(t, string(sonnetBody), `"effort":"high"`)
+	assert.NotContains(t, string(sonnetBody), `"effort":"xhigh"`)
+
+	opusParams := p.buildRequestParams(req, "claude-opus-4-7", model.ThinkingXHigh).messageNewParams(defaultMaxTokens)
+	opusBody, err := json.Marshal(opusParams)
+	require.NoError(t, err)
+	assert.Contains(t, string(opusBody), `"thinking"`)
+	assert.Contains(t, string(opusBody), `"effort":"xhigh"`)
+}
+
 func TestStream_ThinkingContentEmitted(t *testing.T) {
 	events := []sseEvent{
 		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},

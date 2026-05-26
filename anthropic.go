@@ -424,15 +424,23 @@ func isRetriableError(err error) bool {
 	return false
 }
 
-func (p *provider) buildParams(req sdk.ProviderRequest, mdl string, maxTokens int, thinkingLevel model.ThinkingLevel) anthropic.MessageNewParams {
-	params := anthropic.MessageNewParams{
-		Model:     mdl,
-		MaxTokens: int64(maxTokens),
-		Messages:  convertMessages(req.Messages),
+type anthropicRequestParams struct {
+	model        string
+	messages     []anthropic.MessageParam
+	system       []anthropic.TextBlockParam
+	tools        []anthropic.ToolUnionParam
+	thinking     anthropic.ThinkingConfigParamUnion
+	outputConfig anthropic.OutputConfigParam
+}
+
+func (p *provider) buildRequestParams(req sdk.ProviderRequest, mdl string, thinkingLevel model.ThinkingLevel) anthropicRequestParams {
+	params := anthropicRequestParams{
+		model:    mdl,
+		messages: convertMessages(req.Messages),
 	}
 
 	if req.SystemPrompt != "" {
-		params.System = []anthropic.TextBlockParam{
+		params.system = []anthropic.TextBlockParam{
 			{
 				Text:         req.SystemPrompt,
 				CacheControl: anthropic.NewCacheControlEphemeralParam(),
@@ -441,13 +449,13 @@ func (p *provider) buildParams(req sdk.ProviderRequest, mdl string, maxTokens in
 	}
 
 	if len(req.Tools) > 0 {
-		params.Tools = convertTools(req.Tools)
+		params.tools = convertTools(req.Tools)
 	}
 
 	thinkingLevel = resolveThinkingLevel(mdl, thinkingLevel)
 
 	if thinkingLevel != model.ThinkingOff {
-		params.Thinking = anthropic.ThinkingConfigParamUnion{
+		params.thinking = anthropic.ThinkingConfigParamUnion{
 			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
 		}
 
@@ -460,11 +468,27 @@ func (p *provider) buildParams(req sdk.ProviderRequest, mdl string, maxTokens in
 		}
 
 		if effort, ok := effortMap[thinkingLevel]; ok {
-			params.OutputConfig = anthropic.OutputConfigParam{Effort: effort}
+			params.outputConfig = anthropic.OutputConfigParam{Effort: effort}
 		}
 	}
 
 	return params
+}
+
+func (params anthropicRequestParams) messageNewParams(maxTokens int) anthropic.MessageNewParams {
+	return anthropic.MessageNewParams{
+		Model:        params.model,
+		MaxTokens:    int64(maxTokens),
+		Messages:     params.messages,
+		System:       params.system,
+		Tools:        params.tools,
+		Thinking:     params.thinking,
+		OutputConfig: params.outputConfig,
+	}
+}
+
+func (p *provider) buildParams(req sdk.ProviderRequest, mdl string, maxTokens int, thinkingLevel model.ThinkingLevel) anthropic.MessageNewParams {
+	return p.buildRequestParams(req, mdl, thinkingLevel).messageNewParams(maxTokens)
 }
 
 func resolveThinkingLevel(mdl string, level model.ThinkingLevel) model.ThinkingLevel {

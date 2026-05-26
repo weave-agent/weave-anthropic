@@ -48,12 +48,12 @@
 ## Implementation Steps
 
 ### Task 1: Refactor request parameter construction for reuse
-- [ ] extract shared message/tool/system/thinking parameter construction if needed for both stream and count paths
-- [ ] ensure streaming behavior and cache control are unchanged
-- [ ] preserve model override behavior from `model.StreamOption`
-- [ ] write tests proving stream request params remain equivalent after refactor
-- [ ] write tests for thinking level clamping in reused path
-- [ ] run `go test ./...` - must pass before next task
+- [x] extract shared message/tool/system/thinking parameter construction if needed for both stream and count paths
+- [x] ensure streaming behavior and cache control are unchanged
+- [x] preserve model override behavior from `model.StreamOption`
+- [x] write tests proving stream request params remain equivalent after refactor
+- [x] write tests for thinking level clamping in reused path
+- [x] run `go test ./...` - must pass before next task
 
 ### Task 2: Implement `sdk.TokenCounter` for Anthropic provider
 - [ ] add `CountTokens(ctx, req, opts...)` method on provider
