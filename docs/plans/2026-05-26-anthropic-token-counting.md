@@ -80,7 +80,7 @@
 - [x] verify no credentials or request bodies are logged in count errors
 
 ### Task 5: Update documentation
-- [ ] update README or docs to mention exact token counting support if provider capabilities are documented
+- [x] update README or docs to mention exact token counting support if provider capabilities are documented
 
 ## Technical Details
 - Count-token calls should use the same model resolution as streaming.

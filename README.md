@@ -48,6 +48,10 @@ Anthropic also supports shared Weave provider HTTP and retry settings. Defaults 
 
 Duration values use Go duration strings such as `250ms`, `2s`, or `1m`. Retry jitter accepts `full` or `none`.
 
+## Capabilities
+
+The Anthropic provider supports exact preflight input token counting through Anthropic's messages count-tokens API. Counts use the same converted system prompt, messages, tools, model selection, and thinking settings as streaming requests, allowing Weave to make compaction decisions before generation starts.
+
 ## Development
 
 ```bash
