@@ -1231,6 +1231,7 @@ func TestCountTokens_SuccessIncludesSystemPromptAndTools(t *testing.T) {
 
 func TestCountTokens_APIError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("request-id", "req_test_123")
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"invalid model"}}`)
 	}))
@@ -1244,7 +1245,10 @@ func TestCountTokens_APIError(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, count.IsZero())
 	assert.Contains(t, err.Error(), "anthropic: count tokens:")
-	assert.Contains(t, err.Error(), "invalid model")
+	assert.Contains(t, err.Error(), "status_code=400")
+	assert.Contains(t, err.Error(), `request_id="req_test_123"`)
+	assert.Contains(t, err.Error(), `error_type="invalid_request_error"`)
+	assert.NotContains(t, err.Error(), "invalid model")
 }
 
 func TestCountTokens_RetryOn429(t *testing.T) {
@@ -1302,6 +1306,7 @@ func TestCountTokens_ConfiguredZeroRetryDisablesRetries(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, count.IsZero())
 	assert.Contains(t, err.Error(), "max retries exceeded (0)")
+	assert.NotContains(t, err.Error(), "Rate limit exceeded")
 	assert.Equal(t, 1, attemptCount)
 }
 
@@ -1350,8 +1355,9 @@ func TestCountTokens_APIErrorDoesNotExposeCredentialsOrRequestBody(t *testing.T)
 			return
 		}
 
+		w.Header().Set("request-id", "req_secret")
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}`)
+		_, _ = fmt.Fprintf(w, `{"type":"error","error":{"type":"invalid_request_error","message":"bad request containing %s %s %s"}}`, secretSystem, secretUser, secretTool)
 	}))
 	defer server.Close()
 
@@ -1373,6 +1379,9 @@ func TestCountTokens_APIErrorDoesNotExposeCredentialsOrRequestBody(t *testing.T)
 
 	got := err.Error()
 	assert.Contains(t, got, "anthropic: count tokens:")
+	assert.Contains(t, got, `request_id="req_secret"`)
+	assert.Contains(t, got, `error_type="invalid_request_error"`)
+	assert.NotContains(t, got, "bad request containing")
 	assert.NotContains(t, got, "test-key")
 	assert.NotContains(t, got, secretSystem)
 	assert.NotContains(t, got, secretUser)

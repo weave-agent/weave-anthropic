@@ -288,13 +288,51 @@ func (p *provider) countTokensWithRetry(ctx context.Context, params anthropic.Me
 		}
 
 		if !isRetriableError(err) {
-			return nil, fmt.Errorf("request failed: %w", err)
+			return nil, fmt.Errorf("request failed: %w", safeCountTokensError(err))
 		}
 
 		lastErr = err
 	}
 
-	return nil, fmt.Errorf("max retries exceeded (%d): %w", cfg.MaxRetries, lastErr)
+	return nil, fmt.Errorf("max retries exceeded (%d): %w", cfg.MaxRetries, safeCountTokensError(lastErr))
+}
+
+func safeCountTokensError(err error) error {
+	var apiErr *anthropic.Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+
+	errorType := countTokensAPIErrorType(apiErr)
+	if errorType == "" {
+		errorType = "unknown"
+	}
+
+	requestID := apiErr.RequestID
+	if requestID == "" {
+		requestID = "unknown"
+	}
+
+	return fmt.Errorf("anthropic API error: status_code=%d status=%q request_id=%q error_type=%q",
+		apiErr.StatusCode,
+		http.StatusText(apiErr.StatusCode),
+		requestID,
+		errorType,
+	)
+}
+
+func countTokensAPIErrorType(apiErr *anthropic.Error) string {
+	var body struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal([]byte(apiErr.RawJSON()), &body); err != nil {
+		return ""
+	}
+
+	return body.Error.Type
 }
 
 // streamAccumulator tracks content emitted across retry attempts to
