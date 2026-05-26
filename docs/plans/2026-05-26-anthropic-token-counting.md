@@ -65,12 +65,12 @@
 - [x] run `go test ./...` - must pass before next task
 
 ### Task 3: Verify thinking and cache behavior
-- [ ] confirm count requests include thinking configuration when enabled
-- [ ] confirm count requests are not treated as prompt-cache writes in telemetry
-- [ ] preserve existing cache control in normal streaming requests
-- [ ] write tests for count with thinking enabled and disabled
-- [ ] write tests confirming normal usage events still emit cache creation/read tokens
-- [ ] run `go test ./...` - must pass before next task
+- [x] confirm count requests include thinking configuration when enabled
+- [x] confirm count requests are not treated as prompt-cache writes in telemetry
+- [x] preserve existing cache control in normal streaming requests
+- [x] write tests for count with thinking enabled and disabled
+- [x] write tests confirming normal usage events still emit cache creation/read tokens
+- [x] run `go test ./...` - must pass before next task
 
 ### Task 4: Verify acceptance criteria
 - [ ] verify provider satisfies `sdk.TokenCounter`

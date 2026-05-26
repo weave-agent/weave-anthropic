@@ -1233,6 +1233,105 @@ func TestCountTokens_APIError(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid model")
 }
 
+func TestCountTokens_WithThinkingLevel(t *testing.T) {
+	model.ResetModelRegistry()
+	defer model.ResetModelRegistry()
+
+	RegisterModels()
+
+	var receivedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/messages/count_tokens", r.URL.Path)
+
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		receivedBody = string(body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"input_tokens":456}`)
+	}))
+	defer server.Close()
+
+	counter := newTestProvider(server).(sdk.TokenCounter)
+	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("think")},
+	}, model.WithThinkingLevel(model.ThinkingHigh))
+	require.NoError(t, err)
+
+	assert.Equal(t, 456, count.InputTokens)
+	assert.Contains(t, receivedBody, `"thinking"`)
+	assert.Contains(t, receivedBody, `"adaptive"`)
+	assert.Contains(t, receivedBody, `"output_config"`)
+	assert.Contains(t, receivedBody, `"effort":"high"`)
+}
+
+func TestCountTokens_ThinkingOffOmitsThinkingParams(t *testing.T) {
+	var receivedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/messages/count_tokens", r.URL.Path)
+
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		receivedBody = string(body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"input_tokens":789}`)
+	}))
+	defer server.Close()
+
+	counter := newTestProvider(server).(sdk.TokenCounter)
+	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("hello")},
+	}, model.WithThinkingLevel(model.ThinkingOff))
+	require.NoError(t, err)
+
+	assert.Equal(t, 789, count.InputTokens)
+	assert.NotContains(t, receivedBody, `"thinking"`)
+	assert.NotContains(t, receivedBody, `"output_config"`)
+}
+
+func TestCountTokens_UsesOnlyCountEndpoint(t *testing.T) {
+	var (
+		requestPaths []string
+		receivedBody string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPaths = append(requestPaths, r.URL.Path)
+
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		receivedBody = string(body)
+
+		if r.URL.Path != "/v1/messages/count_tokens" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprintf(w, `{"type":"error","error":{"type":"invalid_request_error","message":"unexpected endpoint %s"}}`, r.URL.Path)
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"input_tokens":321}`)
+	}))
+	defer server.Close()
+
+	counter := newTestProvider(server).(sdk.TokenCounter)
+	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		SystemPrompt: "You are cached.",
+		Messages: []sdk.Message{
+			sdk.NewUserMessage("Count this"),
+		},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 321, count.InputTokens)
+	assert.Equal(t, []string{"/v1/messages/count_tokens"}, requestPaths)
+	assert.NotContains(t, receivedBody, `"stream"`)
+	assert.NotContains(t, receivedBody, `"usage"`)
+}
+
 func TestStream_ThinkingContentEmitted(t *testing.T) {
 	events := []sseEvent{
 		{EventType: "message_start", Data: `{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}`},
