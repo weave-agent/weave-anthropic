@@ -52,6 +52,8 @@ Duration values use Go duration strings such as `250ms`, `2s`, or `1m`. Retry ji
 
 The Anthropic provider supports exact preflight input token counting through Anthropic's messages count-tokens API. Counts use the same converted system prompt, messages, tools, model selection, and thinking settings as streaming requests, allowing Weave to make compaction decisions before generation starts.
 
+Preflight counting calls `/v1/messages/count_tokens` before generation and returns an error if Anthropic rejects the count request; it does not stream or emit usage events. Anthropic documents count-token responses as estimates, so downstream code should tolerate small differences from final streamed usage even though this provider reports the preflight count as provider-exact.
+
 ## Development
 
 ```bash

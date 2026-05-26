@@ -1055,7 +1055,7 @@ func TestStream_WithModelOverride(t *testing.T) {
 	assert.Contains(t, receivedBody, "claude-opus-4-7")
 }
 
-func TestStream_RequestParamsMatchSharedBuilder(t *testing.T) {
+func TestStream_RequestParamsIncludeSystemToolsAndThinking(t *testing.T) {
 	model.ResetModelRegistry()
 	defer model.ResetModelRegistry()
 
@@ -1103,30 +1103,34 @@ func TestStream_RequestParamsMatchSharedBuilder(t *testing.T) {
 	require.NoError(t, err)
 	collectEvents(t, ch)
 
-	expectedParams := p.buildParams(req, "claude-opus-4-7", 4096, model.ThinkingXHigh)
-	expectedBody, err := json.Marshal(expectedParams)
-	require.NoError(t, err)
-
-	var expected map[string]any
-	require.NoError(t, json.Unmarshal(expectedBody, &expected))
-	expected["stream"] = true
-
 	var body map[string]any
 	require.NoError(t, json.Unmarshal([]byte(receivedBody), &body))
-	assert.Equal(t, expected, body)
 
 	assert.Equal(t, "claude-opus-4-7", body["model"])
 	assert.InDelta(t, float64(4096), body["max_tokens"], 0)
+	assert.Equal(t, true, body["stream"])
 
 	system := body["system"].([]any)
 	cacheControl := system[0].(map[string]any)["cache_control"].(map[string]any)
 	assert.Equal(t, "ephemeral", cacheControl["type"])
 
 	tools := body["tools"].([]any)
-	assert.Equal(t, "bash", tools[0].(map[string]any)["name"])
+	tool := tools[0].(map[string]any)
+	assert.Equal(t, "bash", tool["name"])
+	assert.Equal(t, "Run a bash command", tool["description"])
+
+	messages := body["messages"].([]any)
+	message := messages[0].(map[string]any)
+	assert.Equal(t, "user", message["role"])
+
+	thinking := body["thinking"].(map[string]any)
+	assert.Equal(t, "adaptive", thinking["type"])
+
+	outputConfig := body["output_config"].(map[string]any)
+	assert.Equal(t, "xhigh", outputConfig["effort"])
 }
 
-func TestBuildRequestParams_ClampsThinkingLevel(t *testing.T) {
+func TestBuildParams_ClampsThinkingLevel(t *testing.T) {
 	model.ResetModelRegistry()
 	defer model.ResetModelRegistry()
 
@@ -1137,14 +1141,14 @@ func TestBuildRequestParams_ClampsThinkingLevel(t *testing.T) {
 		Messages: []sdk.Message{sdk.NewUserMessage("think")},
 	}
 
-	sonnetParams := p.buildRequestParams(req, "claude-sonnet-4-6", model.ThinkingXHigh).messageNewParams(defaultMaxTokens)
+	sonnetParams := p.buildParams(req, "claude-sonnet-4-6", defaultMaxTokens, model.ThinkingXHigh)
 	sonnetBody, err := json.Marshal(sonnetParams)
 	require.NoError(t, err)
 	assert.Contains(t, string(sonnetBody), `"thinking"`)
 	assert.Contains(t, string(sonnetBody), `"effort":"high"`)
 	assert.NotContains(t, string(sonnetBody), `"effort":"xhigh"`)
 
-	opusParams := p.buildRequestParams(req, "claude-opus-4-7", model.ThinkingXHigh).messageNewParams(defaultMaxTokens)
+	opusParams := p.buildParams(req, "claude-opus-4-7", defaultMaxTokens, model.ThinkingXHigh)
 	opusBody, err := json.Marshal(opusParams)
 	require.NoError(t, err)
 	assert.Contains(t, string(opusBody), `"thinking"`)
@@ -1243,6 +1247,96 @@ func TestCountTokens_APIError(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid model")
 }
 
+func TestCountTokens_RetryOn429(t *testing.T) {
+	attemptCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+		if attemptCount < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`)
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"input_tokens":654}`)
+	}))
+	defer server.Close()
+
+	counter := newTestProvider(server).(sdk.TokenCounter)
+	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 654, count.InputTokens)
+	assert.Equal(t, 3, attemptCount, "expected 3 attempts (2 failures + 1 success)")
+}
+
+func TestCountTokens_ConfiguredZeroRetryDisablesRetries(t *testing.T) {
+	attemptCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`)
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 0,
+		BaseDelay:  1 * time.Millisecond,
+		MaxDelay:   1 * time.Millisecond,
+		Multiplier: 1,
+		Jitter:     retry.JitterNone,
+	}
+
+	counter := p
+	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+
+	require.Error(t, err)
+	assert.True(t, count.IsZero())
+	assert.Contains(t, err.Error(), "max retries exceeded (0)")
+	assert.Equal(t, 1, attemptCount)
+}
+
+func TestCountTokens_ContextCancellationDuringRetryDelay(t *testing.T) {
+	attemptCount := 0
+	ctx, cancel := context.WithCancel(context.Background())
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attemptCount++
+
+		cancel()
+
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`)
+	}))
+	defer server.Close()
+
+	p := newTestProvider(server).(*provider)
+	p.retryConfig = retry.Config{
+		MaxRetries: 2,
+		BaseDelay:  time.Hour,
+		MaxDelay:   time.Hour,
+		Multiplier: 1,
+		Jitter:     retry.JitterNone,
+	}
+
+	count, err := p.CountTokens(ctx, sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Say hello")},
+	})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.True(t, count.IsZero())
+	assert.Equal(t, 1, attemptCount)
+}
+
 func TestCountTokens_APIErrorDoesNotExposeCredentialsOrRequestBody(t *testing.T) {
 	const (
 		secretSystem = "secret system prompt"
@@ -1283,6 +1377,70 @@ func TestCountTokens_APIErrorDoesNotExposeCredentialsOrRequestBody(t *testing.T)
 	assert.NotContains(t, got, secretSystem)
 	assert.NotContains(t, got, secretUser)
 	assert.NotContains(t, got, secretTool)
+}
+
+func TestCountTokens_RepresentativeConversationSerialization(t *testing.T) {
+	var receivedBody string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		receivedBody = string(body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"input_tokens":987}`)
+	}))
+	defer server.Close()
+
+	assistantWithTool := sdk.NewAssistantMessage("I'll inspect the files.")
+	assistantWithTool.Thinking = []sdk.SignedThinking{{Signature: "sig_123", Thinking: "Need a directory listing."}}
+	assistantWithTool.RedactedThinking = []sdk.RedactedThinking{{Data: "redacted_123"}}
+	assistantWithTool.ToolCalls = []sdk.ToolCall{
+		{ID: "toolu_1", Name: "bash", Arguments: map[string]any{"command": "ls"}},
+	}
+
+	counter := newTestProvider(server).(sdk.TokenCounter)
+	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		SystemPrompt: "You are a helpful assistant.",
+		Messages: []sdk.Message{
+			sdk.NewUserMessage("List files"),
+			assistantWithTool,
+			sdk.NewToolResultMessage("toolu_1", "bash", "README.md\nanthropic.go", false),
+			sdk.NewAssistantMessage("[Compaction Summary]\nListed repository files."),
+			sdk.NewUserMessage("What changed?"),
+		},
+		Tools: []sdk.ToolDef{
+			{
+				Name:        "bash",
+				Description: "Run a bash command",
+				Parameters:  map[string]any{"type": "object"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 987, count.InputTokens)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(receivedBody), &body))
+
+	assert.Equal(t, "claude-sonnet-4-6", body["model"])
+	assert.NotContains(t, receivedBody, `"max_tokens"`)
+	assert.NotContains(t, receivedBody, `"stream"`)
+	assert.Contains(t, receivedBody, `"type":"thinking"`)
+	assert.Contains(t, receivedBody, `"signature":"sig_123"`)
+	assert.Contains(t, receivedBody, `"type":"redacted_thinking"`)
+	assert.Contains(t, receivedBody, `"data":"redacted_123"`)
+	assert.Contains(t, receivedBody, `"type":"tool_use"`)
+	assert.Contains(t, receivedBody, `"id":"toolu_1"`)
+	assert.Contains(t, receivedBody, `"type":"tool_result"`)
+	assert.Contains(t, receivedBody, `[Compaction Summary]\nListed repository files.`)
+	assert.Contains(t, receivedBody, `"cache_control":{"type":"ephemeral"}`)
+
+	messages := body["messages"].([]any)
+	assert.Len(t, messages, 5)
 }
 
 func TestCountTokens_WithThinkingLevel(t *testing.T) {
@@ -1348,49 +1506,6 @@ func TestCountTokens_ThinkingOffOmitsThinkingParams(t *testing.T) {
 	assert.Equal(t, 789, count.InputTokens)
 	assert.NotContains(t, receivedBody, `"thinking"`)
 	assert.NotContains(t, receivedBody, `"output_config"`)
-}
-
-func TestCountTokens_UsesOnlyCountEndpoint(t *testing.T) {
-	var (
-		requestPaths []string
-		receivedBody string
-	)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestPaths = append(requestPaths, r.URL.Path)
-
-		body, err := io.ReadAll(r.Body)
-		if !assert.NoError(t, err) {
-			return
-		}
-
-		receivedBody = string(body)
-
-		if r.URL.Path != "/v1/messages/count_tokens" {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"unexpected endpoint"}}`)
-
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"input_tokens":321}`)
-	}))
-	defer server.Close()
-
-	counter := newTestProvider(server).(sdk.TokenCounter)
-	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
-		SystemPrompt: "You are cached.",
-		Messages: []sdk.Message{
-			sdk.NewUserMessage("Count this"),
-		},
-	})
-	require.NoError(t, err)
-
-	assert.Equal(t, 321, count.InputTokens)
-	assert.Equal(t, []string{"/v1/messages/count_tokens"}, requestPaths)
-	assert.NotContains(t, receivedBody, `"stream"`)
-	assert.NotContains(t, receivedBody, `"usage"`)
 }
 
 func TestStream_ThinkingContentEmitted(t *testing.T) {

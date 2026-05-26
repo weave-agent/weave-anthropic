@@ -241,9 +241,9 @@ func (p *provider) CountTokens(ctx context.Context, req sdk.ProviderRequest, opt
 		modelName = p.model
 	}
 
-	params := p.buildRequestParams(req, modelName, so.ThinkingLevel).messageCountTokensParams()
+	params := p.buildCountTokensParams(req, modelName, so.ThinkingLevel)
 
-	count, err := p.client.Messages.CountTokens(ctx, params)
+	count, err := p.countTokensWithRetry(ctx, params)
 	if err != nil {
 		return sdk.TokenCount{}, fmt.Errorf("anthropic: count tokens: %w", err)
 	}
@@ -253,6 +253,48 @@ func (p *provider) CountTokens(ctx context.Context, req sdk.ProviderRequest, opt
 		Source:      sdk.TokenCountSourceExact,
 		Confidence:  1.0,
 	}, nil
+}
+
+func (p *provider) countTokensWithRetry(ctx context.Context, params anthropic.MessageCountTokensParams) (*anthropic.MessageTokensCount, error) {
+	cfg := p.retryConfig
+
+	var lastErr error
+
+	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		if attempt > 0 {
+			delay := retry.JitteredDelay(retry.CalculateDelay(cfg, attempt-1), cfg.Jitter)
+			sdk.Logger("anthropic").Debug("anthropic count tokens retry",
+				"attempt", attempt,
+				"next_attempt", attempt+1,
+				"max_retries", cfg.MaxRetries,
+				"delay", delay.String(),
+				"error_type", fmt.Sprintf("%T", lastErr),
+			)
+
+			timer := time.NewTimer(delay)
+
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+
+				return nil, fmt.Errorf("retry delay canceled: %w", ctx.Err())
+			}
+		}
+
+		count, err := p.client.Messages.CountTokens(ctx, params)
+		if err == nil {
+			return count, nil
+		}
+
+		if !isRetriableError(err) {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+
+		lastErr = err
+	}
+
+	return nil, fmt.Errorf("max retries exceeded (%d): %w", cfg.MaxRetries, lastErr)
 }
 
 // streamAccumulator tracks content emitted across retry attempts to
@@ -450,23 +492,15 @@ func isRetriableError(err error) bool {
 	return false
 }
 
-type anthropicRequestParams struct {
-	model        string
-	messages     []anthropic.MessageParam
-	system       []anthropic.TextBlockParam
-	tools        []anthropic.ToolUnionParam
-	thinking     anthropic.ThinkingConfigParamUnion
-	outputConfig anthropic.OutputConfigParam
-}
-
-func (p *provider) buildRequestParams(req sdk.ProviderRequest, mdl string, thinkingLevel model.ThinkingLevel) anthropicRequestParams {
-	params := anthropicRequestParams{
-		model:    mdl,
-		messages: convertMessages(req.Messages),
+func (p *provider) buildParams(req sdk.ProviderRequest, mdl string, maxTokens int, thinkingLevel model.ThinkingLevel) anthropic.MessageNewParams {
+	params := anthropic.MessageNewParams{
+		Model:     mdl,
+		MaxTokens: int64(maxTokens),
+		Messages:  convertMessages(req.Messages),
 	}
 
 	if req.SystemPrompt != "" {
-		params.system = []anthropic.TextBlockParam{
+		params.System = []anthropic.TextBlockParam{
 			{
 				Text:         req.SystemPrompt,
 				CacheControl: anthropic.NewCacheControlEphemeralParam(),
@@ -475,13 +509,13 @@ func (p *provider) buildRequestParams(req sdk.ProviderRequest, mdl string, think
 	}
 
 	if len(req.Tools) > 0 {
-		params.tools = convertTools(req.Tools)
+		params.Tools = convertTools(req.Tools)
 	}
 
 	thinkingLevel = resolveThinkingLevel(mdl, thinkingLevel)
 
 	if thinkingLevel != model.ThinkingOff {
-		params.thinking = anthropic.ThinkingConfigParamUnion{
+		params.Thinking = anthropic.ThinkingConfigParamUnion{
 			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
 		}
 
@@ -494,38 +528,55 @@ func (p *provider) buildRequestParams(req sdk.ProviderRequest, mdl string, think
 		}
 
 		if effort, ok := effortMap[thinkingLevel]; ok {
-			params.outputConfig = anthropic.OutputConfigParam{Effort: effort}
+			params.OutputConfig = anthropic.OutputConfigParam{Effort: effort}
 		}
 	}
 
 	return params
 }
 
-func (params anthropicRequestParams) messageNewParams(maxTokens int) anthropic.MessageNewParams {
-	return anthropic.MessageNewParams{
-		Model:        params.model,
-		MaxTokens:    int64(maxTokens),
-		Messages:     params.messages,
-		System:       params.system,
-		Tools:        params.tools,
-		Thinking:     params.thinking,
-		OutputConfig: params.outputConfig,
+func (p *provider) buildCountTokensParams(req sdk.ProviderRequest, mdl string, thinkingLevel model.ThinkingLevel) anthropic.MessageCountTokensParams {
+	params := anthropic.MessageCountTokensParams{
+		Model:    mdl,
+		Messages: convertMessages(req.Messages),
 	}
-}
 
-func (params anthropicRequestParams) messageCountTokensParams() anthropic.MessageCountTokensParams {
-	return anthropic.MessageCountTokensParams{
-		Model:        params.model,
-		Messages:     params.messages,
-		System:       anthropic.MessageCountTokensParamsSystemUnion{OfTextBlockArray: params.system},
-		Tools:        countTokensTools(params.tools),
-		Thinking:     params.thinking,
-		OutputConfig: params.outputConfig,
+	if req.SystemPrompt != "" {
+		params.System = anthropic.MessageCountTokensParamsSystemUnion{
+			OfTextBlockArray: []anthropic.TextBlockParam{
+				{
+					Text:         req.SystemPrompt,
+					CacheControl: anthropic.NewCacheControlEphemeralParam(),
+				},
+			},
+		}
 	}
-}
 
-func (p *provider) buildParams(req sdk.ProviderRequest, mdl string, maxTokens int, thinkingLevel model.ThinkingLevel) anthropic.MessageNewParams {
-	return p.buildRequestParams(req, mdl, thinkingLevel).messageNewParams(maxTokens)
+	if len(req.Tools) > 0 {
+		params.Tools = convertCountTokensTools(req.Tools)
+	}
+
+	thinkingLevel = resolveThinkingLevel(mdl, thinkingLevel)
+
+	if thinkingLevel != model.ThinkingOff {
+		params.Thinking = anthropic.ThinkingConfigParamUnion{
+			OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{},
+		}
+
+		effortMap := map[model.ThinkingLevel]anthropic.OutputConfigEffort{
+			model.ThinkingMinimal: anthropic.OutputConfigEffortLow,
+			model.ThinkingLow:     anthropic.OutputConfigEffortLow,
+			model.ThinkingMedium:  anthropic.OutputConfigEffortMedium,
+			model.ThinkingHigh:    anthropic.OutputConfigEffortHigh,
+			model.ThinkingXHigh:   anthropic.OutputConfigEffortXhigh,
+		}
+
+		if effort, ok := effortMap[thinkingLevel]; ok {
+			params.OutputConfig = anthropic.OutputConfigParam{Effort: effort}
+		}
+	}
+
+	return params
 }
 
 func resolveThinkingLevel(mdl string, level model.ThinkingLevel) model.ThinkingLevel {
@@ -704,17 +755,12 @@ func convertTools(tools []sdk.ToolDef) []anthropic.ToolUnionParam {
 	return result
 }
 
-func countTokensTools(tools []anthropic.ToolUnionParam) []anthropic.MessageCountTokensToolUnionParam {
-	if len(tools) == 0 {
-		return nil
-	}
+func convertCountTokensTools(tools []sdk.ToolDef) []anthropic.MessageCountTokensToolUnionParam {
+	messageTools := convertTools(tools)
+	result := make([]anthropic.MessageCountTokensToolUnionParam, len(messageTools))
 
-	result := make([]anthropic.MessageCountTokensToolUnionParam, 0, len(tools))
-
-	for _, tool := range tools {
-		if tool.OfTool != nil {
-			result = append(result, anthropic.MessageCountTokensToolUnionParam{OfTool: tool.OfTool})
-		}
+	for i, tool := range messageTools {
+		result[i] = anthropic.MessageCountTokensToolUnionParam{OfTool: tool.OfTool}
 	}
 
 	return result

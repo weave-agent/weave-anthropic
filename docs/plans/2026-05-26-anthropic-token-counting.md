@@ -81,6 +81,7 @@
 
 ### Task 5: Update documentation
 - [x] update README or docs to mention exact token counting support if provider capabilities are documented
+- [x] update `CLAUDE.md` with token counting maintenance rules, count endpoint behavior, retry behavior, and safe error/logging constraints
 
 ## Technical Details
 - Count-token calls should use the same model resolution as streaming.
