@@ -73,11 +73,11 @@
 - [x] run `go test ./...` - must pass before next task
 
 ### Task 4: Verify acceptance criteria
-- [ ] verify provider satisfies `sdk.TokenCounter`
-- [ ] verify stream API behavior is unchanged
-- [ ] run full provider tests with `go test ./...`
-- [ ] run `golangci-lint run` or repo lint command
-- [ ] verify no credentials or request bodies are logged in count errors
+- [x] verify provider satisfies `sdk.TokenCounter`
+- [x] verify stream API behavior is unchanged
+- [x] run full provider tests with `go test ./...`
+- [x] run `golangci-lint run` or repo lint command
+- [x] verify no credentials or request bodies are logged in count errors
 
 ### Task 5: Update documentation
 - [ ] update README or docs to mention exact token counting support if provider capabilities are documented

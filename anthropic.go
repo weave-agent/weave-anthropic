@@ -23,6 +23,7 @@ import (
 )
 
 const (
+	providerName     = "anthropic"
 	defaultModel     = "claude-sonnet-4-6"
 	defaultMaxTokens = 16384
 )
@@ -45,8 +46,11 @@ type provider struct {
 	retryConfig retry.Config
 }
 
+var _ sdk.TokenCounter = (*provider)(nil)
+
+//nolint:gochecknoinits // Provider registration is intentionally package side-effect driven.
 func init() {
-	sdk.RegisterProvider[AnthropicConfig, AuthConfig]("anthropic", newProvider)
+	sdk.RegisterProvider[AnthropicConfig, AuthConfig](providerName, newProvider)
 }
 
 var newAnthropicClient = func(apiKey string, httpClient *http.Client) anthropic.Client {
@@ -62,14 +66,14 @@ func newProvider(cfg sdk.Config, ac AnthropicConfig, a AuthConfig) (sdk.Provider
 		return nil, errors.New("anthropic: API key required (set ANTHROPIC_API_KEY)")
 	}
 
-	httpClient, _, err := providerhttp.ForProvider(cfg, "anthropic")
+	httpClient, _, err := providerhttp.ForProvider(cfg, providerName)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic: configure http: %w", err)
 	}
 
-	retryCfg, _, err := providerretry.ForProvider(cfg, "anthropic")
+	retryCfg, _, err := providerretry.ForProvider(cfg, providerName)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("anthropic: configure retry: %w", err)
 	}
 
 	return &provider{

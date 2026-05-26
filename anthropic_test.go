@@ -200,9 +200,11 @@ func TestNewProvider_AppliesCustomHTTPConfig(t *testing.T) {
 	}
 
 	var capturedAPIKey string
+
 	var capturedHTTPClient *http.Client
 
 	oldFactory := newAnthropicClient
+
 	newAnthropicClient = func(apiKey string, httpClient *http.Client) anthropic.Client {
 		capturedAPIKey = apiKey
 		capturedHTTPClient = httpClient
@@ -681,6 +683,7 @@ func TestStream_ConfiguredZeroRetryDisablesSDKRetries(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attemptCount++
+
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`)
 	}))
@@ -725,6 +728,7 @@ func TestStream_UsesConfiguredRetryConfig(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attemptCount++
+
 		writeSSEAndClose(w, partialEvents)
 	}))
 	defer server.Close()
@@ -762,6 +766,7 @@ func TestStream_UsesConfiguredRetryDelay(t *testing.T) {
 	var logs bytes.Buffer
 
 	oldLogger := slog.Default()
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(oldLogger)
 
@@ -826,6 +831,7 @@ func writeSSEAndClose(w http.ResponseWriter, events []sseEvent) {
 
 	for _, evt := range events {
 		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.EventType, evt.Data)
+
 		flusher.Flush()
 	}
 
@@ -930,6 +936,7 @@ func TestStream_RetryDebugLogUsesSafeFields(t *testing.T) {
 	var logs bytes.Buffer
 
 	oldLogger := slog.Default()
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(oldLogger)
 
@@ -1109,7 +1116,7 @@ func TestStream_RequestParamsMatchSharedBuilder(t *testing.T) {
 	assert.Equal(t, expected, body)
 
 	assert.Equal(t, "claude-opus-4-7", body["model"])
-	assert.Equal(t, float64(4096), body["max_tokens"])
+	assert.InDelta(t, float64(4096), body["max_tokens"], 0)
 
 	system := body["system"].([]any)
 	cacheControl := system[0].(map[string]any)["cache_control"].(map[string]any)
@@ -1154,7 +1161,10 @@ func TestCountTokens_SuccessIncludesSystemPromptAndTools(t *testing.T) {
 		receivedPath = r.URL.Path
 
 		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
+		if !assert.NoError(t, err) {
+			return
+		}
+
 		receivedBody = string(body)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1233,6 +1243,48 @@ func TestCountTokens_APIError(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid model")
 }
 
+func TestCountTokens_APIErrorDoesNotExposeCredentialsOrRequestBody(t *testing.T) {
+	const (
+		secretSystem = "secret system prompt"
+		secretUser   = "secret user prompt"
+		secretTool   = "secret_tool"
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.ReadAll(r.Body)
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}`)
+	}))
+	defer server.Close()
+
+	counter := newTestProvider(server).(sdk.TokenCounter)
+	_, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		SystemPrompt: secretSystem,
+		Messages: []sdk.Message{
+			sdk.NewUserMessage(secretUser),
+		},
+		Tools: []sdk.ToolDef{
+			{
+				Name:        secretTool,
+				Description: "tool description",
+				Parameters:  map[string]any{"type": "object"},
+			},
+		},
+	})
+	require.Error(t, err)
+
+	got := err.Error()
+	assert.Contains(t, got, "anthropic: count tokens:")
+	assert.NotContains(t, got, "test-key")
+	assert.NotContains(t, got, secretSystem)
+	assert.NotContains(t, got, secretUser)
+	assert.NotContains(t, got, secretTool)
+}
+
 func TestCountTokens_WithThinkingLevel(t *testing.T) {
 	model.ResetModelRegistry()
 	defer model.ResetModelRegistry()
@@ -1245,7 +1297,10 @@ func TestCountTokens_WithThinkingLevel(t *testing.T) {
 		assert.Equal(t, "/v1/messages/count_tokens", r.URL.Path)
 
 		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
+		if !assert.NoError(t, err) {
+			return
+		}
+
 		receivedBody = string(body)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1273,7 +1328,10 @@ func TestCountTokens_ThinkingOffOmitsThinkingParams(t *testing.T) {
 		assert.Equal(t, "/v1/messages/count_tokens", r.URL.Path)
 
 		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
+		if !assert.NoError(t, err) {
+			return
+		}
+
 		receivedBody = string(body)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1302,12 +1360,15 @@ func TestCountTokens_UsesOnlyCountEndpoint(t *testing.T) {
 		requestPaths = append(requestPaths, r.URL.Path)
 
 		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
+		if !assert.NoError(t, err) {
+			return
+		}
+
 		receivedBody = string(body)
 
 		if r.URL.Path != "/v1/messages/count_tokens" {
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = fmt.Fprintf(w, `{"type":"error","error":{"type":"invalid_request_error","message":"unexpected endpoint %s"}}`, r.URL.Path)
+			_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"unexpected endpoint"}}`)
 
 			return
 		}
