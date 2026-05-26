@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/anthropics/anthropic-sdk-go v1.37.0
 	github.com/stretchr/testify v1.11.1
-	github.com/weave-agent/weave v0.0.7
+	github.com/weave-agent/weave v0.0.11
 )
 
 require (
