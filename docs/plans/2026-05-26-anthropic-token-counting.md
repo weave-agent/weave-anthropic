@@ -56,13 +56,13 @@
 - [x] run `go test ./...` - must pass before next task
 
 ### Task 2: Implement `sdk.TokenCounter` for Anthropic provider
-- [ ] add `CountTokens(ctx, req, opts...)` method on provider
-- [ ] call Anthropic count-tokens API using converted system prompt, messages, tools, model, and thinking settings
-- [ ] return `sdk.TokenCount` with exact source and high confidence
-- [ ] wrap provider/API errors with `anthropic:` context
-- [ ] write tests for successful count including system prompt and tools
-- [ ] write tests for API error propagation
-- [ ] run `go test ./...` - must pass before next task
+- [x] add `CountTokens(ctx, req, opts...)` method on provider
+- [x] call Anthropic count-tokens API using converted system prompt, messages, tools, model, and thinking settings
+- [x] return `sdk.TokenCount` with exact source and high confidence
+- [x] wrap provider/API errors with `anthropic:` context
+- [x] write tests for successful count including system prompt and tools
+- [x] write tests for API error propagation
+- [x] run `go test ./...` - must pass before next task
 
 ### Task 3: Verify thinking and cache behavior
 - [ ] confirm count requests include thinking configuration when enabled

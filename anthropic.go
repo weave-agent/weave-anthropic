@@ -229,6 +229,28 @@ func (p *provider) Stream(ctx context.Context, req sdk.ProviderRequest, opts ...
 	return ch, nil
 }
 
+func (p *provider) CountTokens(ctx context.Context, req sdk.ProviderRequest, opts ...model.StreamOption) (sdk.TokenCount, error) {
+	so := model.NewStreamOptions(opts...)
+
+	modelName := so.Model
+	if modelName == "" {
+		modelName = p.model
+	}
+
+	params := p.buildRequestParams(req, modelName, so.ThinkingLevel).messageCountTokensParams()
+
+	count, err := p.client.Messages.CountTokens(ctx, params)
+	if err != nil {
+		return sdk.TokenCount{}, fmt.Errorf("anthropic: count tokens: %w", err)
+	}
+
+	return sdk.TokenCount{
+		InputTokens: int(count.InputTokens),
+		Source:      sdk.TokenCountSourceExact,
+		Confidence:  1.0,
+	}, nil
+}
+
 // streamAccumulator tracks content emitted across retry attempts to
 // deduplicate when a retried stream re-emits previously-seen content.
 type streamAccumulator struct {
@@ -487,6 +509,17 @@ func (params anthropicRequestParams) messageNewParams(maxTokens int) anthropic.M
 	}
 }
 
+func (params anthropicRequestParams) messageCountTokensParams() anthropic.MessageCountTokensParams {
+	return anthropic.MessageCountTokensParams{
+		Model:        params.model,
+		Messages:     params.messages,
+		System:       anthropic.MessageCountTokensParamsSystemUnion{OfTextBlockArray: params.system},
+		Tools:        countTokensTools(params.tools),
+		Thinking:     params.thinking,
+		OutputConfig: params.outputConfig,
+	}
+}
+
 func (p *provider) buildParams(req sdk.ProviderRequest, mdl string, maxTokens int, thinkingLevel model.ThinkingLevel) anthropic.MessageNewParams {
 	return p.buildRequestParams(req, mdl, thinkingLevel).messageNewParams(maxTokens)
 }
@@ -661,6 +694,22 @@ func convertTools(tools []sdk.ToolDef) []anthropic.ToolUnionParam {
 					Required:   required,
 				},
 			},
+		}
+	}
+
+	return result
+}
+
+func countTokensTools(tools []anthropic.ToolUnionParam) []anthropic.MessageCountTokensToolUnionParam {
+	if len(tools) == 0 {
+		return nil
+	}
+
+	result := make([]anthropic.MessageCountTokensToolUnionParam, 0, len(tools))
+
+	for _, tool := range tools {
+		if tool.OfTool != nil {
+			result = append(result, anthropic.MessageCountTokensToolUnionParam{OfTool: tool.OfTool})
 		}
 	}
 

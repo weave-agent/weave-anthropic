@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1141,6 +1142,95 @@ func TestBuildRequestParams_ClampsThinkingLevel(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(opusBody), `"thinking"`)
 	assert.Contains(t, string(opusBody), `"effort":"xhigh"`)
+}
+
+func TestCountTokens_SuccessIncludesSystemPromptAndTools(t *testing.T) {
+	var (
+		receivedPath string
+		receivedBody string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		receivedBody = string(body)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"input_tokens":123}`)
+	}))
+	defer server.Close()
+
+	counter, ok := newTestProvider(server).(sdk.TokenCounter)
+	require.True(t, ok)
+
+	count, err := counter.CountTokens(
+		context.Background(),
+		sdk.ProviderRequest{
+			SystemPrompt: "You are a helpful assistant.",
+			Messages: []sdk.Message{
+				sdk.NewUserMessage("Use the tool"),
+			},
+			Tools: []sdk.ToolDef{
+				{
+					Name:        "bash",
+					Description: "Run a bash command",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"command": map[string]any{"type": "string"},
+						},
+						"required": []string{"command"},
+					},
+				},
+			},
+		},
+		model.WithModel("claude-opus-4-7"),
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, "/v1/messages/count_tokens", receivedPath)
+	assert.Equal(t, sdk.TokenCount{
+		InputTokens: 123,
+		Source:      sdk.TokenCountSourceExact,
+		Confidence:  1.0,
+	}, count)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(receivedBody), &body))
+
+	assert.Equal(t, "claude-opus-4-7", body["model"])
+
+	system := body["system"].([]any)
+	assert.Equal(t, "You are a helpful assistant.", system[0].(map[string]any)["text"])
+
+	tools := body["tools"].([]any)
+	tool := tools[0].(map[string]any)
+	assert.Equal(t, "bash", tool["name"])
+	assert.Equal(t, "Run a bash command", tool["description"])
+
+	messages := body["messages"].([]any)
+	message := messages[0].(map[string]any)
+	assert.Equal(t, "user", message["role"])
+}
+
+func TestCountTokens_APIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"invalid model"}}`)
+	}))
+	defer server.Close()
+
+	counter := newTestProvider(server).(sdk.TokenCounter)
+	count, err := counter.CountTokens(context.Background(), sdk.ProviderRequest{
+		Messages: []sdk.Message{sdk.NewUserMessage("Hello")},
+	})
+
+	require.Error(t, err)
+	assert.True(t, count.IsZero())
+	assert.Contains(t, err.Error(), "anthropic: count tokens:")
+	assert.Contains(t, err.Error(), "invalid model")
 }
 
 func TestStream_ThinkingContentEmitted(t *testing.T) {
